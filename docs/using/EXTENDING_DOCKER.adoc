@@ -27,18 +27,20 @@ You can just create two files with the following content:
 
 plugins.txt::
 
-```
+[source]
+----
 slack
-```
+----
 
 Dockerfile::
 
-```
+[source]
+----
 FROM jenkins/jenkinsfile-runner
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN cd /app/jenkins && jar -cvf jenkins.war *
 RUN java -jar /app/bin/jenkins-plugin-manager.jar --war /app/jenkins/jenkins.war --plugin-file /usr/share/jenkins/ref/plugins.txt && rm /app/jenkins/jenkins.war
-```
+----
 
 Now you have a custom Jenkinsfile Runner image with your own plugins installed!
 See the https://github.com/jenkinsci/plugin-installation-manager-tool[Plugin Installation Manager Tool documentation] for more information about available features.
@@ -61,7 +63,7 @@ for available options and the link:/demo/casc/README.md[JCasC demo] for an examp
 == Custom War Packager
 
 There is an alternative to Vanilla Dockerfile that gives a huge versatility when it comes to generate the docker images.
-See the demo for a better understanding on link:(/demo/cwphow to build Jenkinsfile Runner with Custom WAR Packager].
+See the demo for a better understanding on link:/demo/cwp[how to build Jenkinsfile Runner with Custom WAR Packager].
 
 Once the docker image is generated you can execute it in the same way as a Vanilla image with the only exception of the master workspace.
 The default directory is `/build` as well but it can be overridden using the `--runworkspace` Jenkinsfile Runner option.

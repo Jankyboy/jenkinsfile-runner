@@ -1,5 +1,8 @@
 package io.jenkins.jenkinsfile.runner;
 
+import com.cloudbees.hudson.plugins.folder.Folder;
+import com.cloudbees.plugins.credentials.Credentials;
+import com.cloudbees.plugins.credentials.CredentialsUnavailableException;
 import hudson.model.Action;
 import hudson.model.Cause;
 import hudson.model.CauseAction;
@@ -7,14 +10,13 @@ import hudson.model.Failure;
 import hudson.model.ParametersAction;
 import hudson.model.StringParameterValue;
 import hudson.model.queue.QueueTaskFuture;
-import io.jenkins.jenkinsfile.runner.bootstrap.Bootstrap;
+import io.jenkins.jenkinsfile.runner.bootstrap.commands.PipelineRunOptions;
 import jenkins.model.Jenkins;
-
-import org.apache.commons.io.FileUtils;
 import org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition;
+import org.jenkinsci.plugins.workflow.flow.FlowDurabilityHint;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
-import org.jenkinsci.plugins.workflow.multibranch.yaml.pipeline.PipelineAsYamlScriptFlowDefinition;
+import org.jenkinsci.plugins.workflow.job.properties.DurabilityHintJobProperty;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -22,6 +24,7 @@ import java.io.PrintStream;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
@@ -32,42 +35,85 @@ import java.util.stream.Collectors;
 public class Runner {
     private WorkflowRun b;
 
+    private static final Logger LOGGER = Logger.getLogger(Runner.class.getName());
+
     /**
      * Main entry point invoked by the setup module
      */
-    public int run(Bootstrap bootstrap) throws Exception {
-        try {
-          Jenkins.checkGoodName(bootstrap.jobName); 
-        } catch (Failure e) {
-          System.err.println(String.format("invalid job name: '%s': %s", bootstrap.jobName, e.getMessage())); 
-          return -1;
-        } 
-        Jenkins j = Jenkins.getInstance();
-        WorkflowJob w = j.createProject(WorkflowJob.class, bootstrap.jobName);
-        w.updateNextBuildNumber(bootstrap.buildNumber);
-        w.setResumeBlocked(true);
-        List<Action> workflowActionsList = new ArrayList<>(3);
+    public int run(PipelineRunOptions runOptions) throws Exception { 
+        String[] jobPathNames = runOptions.jobName.split("/");
+        
+        for (int i=0; i < jobPathNames.length; i++) {
+            try {
+                Jenkins.checkGoodName(jobPathNames[i]);
+            } catch (Failure e) {
+                System.err.println(String.format("invalid job name: '%s': %s", jobPathNames[i], e.getMessage()));
+                return -1;
+            } 
+        }
 
-        if (bootstrap.jenkinsfile.getName().endsWith(".yml")) {
-          // We do not use SCM definition here due to https://github.com/jenkinsci/pipeline-as-yaml-plugin/issues/28
-          w.setDefinition(new PipelineAsYamlScriptFlowDefinition(
-            FileUtils.readFileToString(bootstrap.jenkinsfile),!bootstrap.noSandBox));
+        Folder folderInScope = null;
+        WorkflowJob w = null;       
+
+        //create Folder structure
+        for (int i=0; i < jobPathNames.length -1; i++) {
+            folderInScope = createOrReturnFolder(folderInScope, jobPathNames[i]);
+        }
+
+        //add Pipeline to Folder
+        if (folderInScope!=null) {
+            w = folderInScope.createProject(WorkflowJob.class, jobPathNames[jobPathNames.length -1]);
         } else {
-          w.setDefinition(new CpsScmFlowDefinition(
-            new FileSystemSCM(bootstrap.jenkinsfile.getParent()), bootstrap.jenkinsfile.getName()));
-          workflowActionsList.add(new SetJenkinsfileLocation(bootstrap.jenkinsfile, !bootstrap.noSandBox));
+            w = Jenkins.get().createProject(WorkflowJob.class, jobPathNames[jobPathNames.length -1]);
+        }     
+
+        w.updateNextBuildNumber(runOptions.buildNumber);
+        w.setResumeBlocked(true);
+        w.addProperty(new DurabilityHintJobProperty(FlowDurabilityHint.PERFORMANCE_OPTIMIZED));
+
+        List<Action> pipelineActions = new ArrayList<>(3);
+
+        boolean foundProvider = false;
+        for (PipelineDefinitionProvider runner : PipelineDefinitionProvider.all()) {
+            try {
+                if (runner.matches(runOptions)) {
+                    runner.instrumentJob(w, runOptions);
+                    foundProvider = true;
+                    break;
+                }
+            } catch (Exception ex) {
+                throw new Exception("Runner Implementation failed: " + runner.getClass(), ex);
+            }
         }
 
-        if (bootstrap.workflowParameters != null && bootstrap.workflowParameters.size() > 0) {
-          workflowActionsList.add(createParametersAction(bootstrap));
+        if (!foundProvider) { // Create default version
+            if (runOptions.scm != null) {
+                SCMContainer scm = SCMContainer.loadFromYAML(runOptions.scm);
+                Credentials fromSCM = scm.getCredential();
+                if (fromSCM != null) {
+                    try {
+                        scm.addCredentialToStore();
+                    } catch (IOException | CredentialsUnavailableException e) {
+                        return -1;
+                    }
+                }
+                w.setDefinition(new CpsScmFlowDefinition(scm.getSCM(), runOptions.jenkinsfile.getName()));
+            } else {
+                w.setDefinition(new CpsScmFlowDefinition(
+                        new FileSystemSCM(runOptions.jenkinsfile.getParent()), runOptions.jenkinsfile.getName()));
+            }
+            pipelineActions.add(new SetJenkinsfileLocation(runOptions.jenkinsfile, !runOptions.noSandBox));
         }
 
-        if (bootstrap.cause != null) {
-          workflowActionsList.add(createCauseAction(bootstrap.cause));
+        if (runOptions.workflowParameters != null && runOptions.workflowParameters.size() > 0) {
+          pipelineActions.add(createParametersAction(runOptions));
         }
 
-        Action[] workflowActions = workflowActionsList.toArray(new Action[0]);
-        workflowActionsList = null;
+        if (runOptions.cause != null) {
+          pipelineActions.add(createCauseAction(runOptions.cause));
+        }
+
+        Action[] workflowActions = pipelineActions.toArray(new Action[0]);
         QueueTaskFuture<WorkflowRun> f = w.scheduleBuild2(0, workflowActions);
 
         b = f.getStartCondition().get();
@@ -78,8 +124,25 @@ public class Runner {
         return b.getResult().ordinal;
     }
 
-    private Action createParametersAction(Bootstrap bootstrap) {
-      return new ParametersAction(bootstrap.workflowParameters
+    private Folder createOrReturnFolder(Folder addToFolder, String folderName) throws IOException {        
+        try {
+            Jenkins j = Jenkins.get();
+
+            if(addToFolder==null) {
+                Folder folder = j.getItem(folderName, j, Folder.class);
+                return  folder!=null ? folder : j.createProject(Folder.class, folderName);
+            }
+
+            Folder folder = j.getItem(folderName, addToFolder.getItemGroup(), Folder.class);
+            return folder !=null ? folder : addToFolder.createProject(Folder.class, folderName);
+        } catch (IOException ex) {
+            System.err.println(String.format("Error creating folder '%s':%s", folderName, ex.getMessage()));
+            throw ex;
+        }   
+    }   
+    
+    private Action createParametersAction(PipelineRunOptions runOptions) {
+      return new ParametersAction(runOptions.workflowParameters
             .entrySet()
             .stream()
             .map(e -> new StringParameterValue(e.getKey(), e.getValue()))

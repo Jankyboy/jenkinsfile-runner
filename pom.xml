@@ -28,13 +28,13 @@ THE SOFTWARE.
   <parent>
     <groupId>org.jenkins-ci</groupId>
     <artifactId>jenkins</artifactId>
-    <version>1.57</version>
+    <version>1.64</version>
     <relativePath />
   </parent>
 
   <groupId>io.jenkins.jenkinsfile-runner</groupId>
   <artifactId>parent</artifactId>
-  <version>1.0-beta-18-SNAPSHOT</version>
+  <version>${revision}${changelist}</version>
   <packaging>pom</packaging>
 
   <name>Jenkinsfile Runner</name>
@@ -53,15 +53,24 @@ THE SOFTWARE.
     <module>setup</module>
     <module>payload-dependencies</module>
     <module>payload</module>
+    <module>app</module>
+    <module>packaging-parent-resources</module>
     <module>packaging-parent-pom</module>
+    <module>packaging-slim-parent-pom</module>
     <!-- more modules come from profiles -->
   </modules>
 
   <properties>
+    <revision>1.0-beta-30</revision>
+    <changelist>-SNAPSHOT</changelist>
+    <gitHubRepo>jenkinsci/jenkinsfile-runner</gitHubRepo>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <java.level>8</java.level>
-    <jenkins.version>2.249.1</jenkins.version>
-    <jetty.version>9.4.30.v20200611</jetty.version>
+    <jenkins.version>2.289.1</jenkins.version>
+    <jenkins.bom.baseline>bom-2.289.x</jenkins.bom.baseline>
+    <jenkins.bom.version>872.v03c18fa35487</jenkins.bom.version>
+    <jetty.version>9.4.39.v20210325</jetty.version>
+    <jenkins-test-harness.version>1589.vc23fca066d5c</jenkins-test-harness.version>
     <!--TODO: Reenable once all the issues are fixed (JENKINS-57353)-->
     <findbugs.failOnError>false</findbugs.failOnError>
   </properties>
@@ -70,8 +79,8 @@ THE SOFTWARE.
     <dependencies>
       <dependency>
         <groupId>io.jenkins.tools.bom</groupId>
-        <artifactId>bom-2.235.x</artifactId>
-        <version>12</version>
+        <artifactId>${jenkins.bom.baseline}</artifactId>
+        <version>${jenkins.bom.version}</version>
         <scope>import</scope>
         <type>pom</type>
       </dependency>
@@ -89,51 +98,17 @@ THE SOFTWARE.
         <artifactId>support-log-formatter</artifactId>
         <version>1.0</version>
       </dependency>
-      <!-- TODO(oleg-nenashev): Remove after 2.238: https://github.com/jenkinsci/jenkins/pull/4702 -->
-      <dependency>
-        <groupId>commons-collections</groupId>
-        <artifactId>commons-collections</artifactId>
-        <version>3.2.2</version>
-      </dependency>
-      <dependency>
-        <groupId>args4j</groupId>
-        <artifactId>args4j</artifactId>
-        <version>2.33</version>
-      </dependency>
-      <dependency>
-        <groupId>org.jenkins-ci</groupId>
-        <artifactId>version-number</artifactId>
-        <version>1.7</version>
-      </dependency>
-      <dependency>
-        <groupId>commons-beanutils</groupId>
-        <artifactId>commons-beanutils</artifactId>
-        <version>1.9.3</version>
+      <dependency> <!-- Upper bounds prevention between Pipeline as YAML and JCAsC-->
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>3.12.0</version>
       </dependency>
 
       <!-- Plugins -->
-      <!--TODO(oleg-nenashev): Remove once in BOM -->
-      <dependency>
-        <groupId>org.jenkins-ci.plugins.workflow</groupId>
-        <artifactId>workflow-multibranch</artifactId>
-        <version>2.22</version>
-      </dependency>
       <dependency>
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>pipeline-utility-steps</artifactId>
-        <version>2.6.1</version>
-      </dependency>
-      <dependency>
-        <groupId>io.jenkins.plugins</groupId>
-        <artifactId>pipeline-as-yaml</artifactId>
-        <version>0.12-rc</version>
-      </dependency>
-
-      <!-- Maven plugins -->
-      <dependency>
-        <groupId>org.jenkins-ci.tools</groupId>
-        <artifactId>maven-hpi-plugin</artifactId>
-        <version>3.15</version>
+        <version>2.8.0</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
@@ -197,22 +172,13 @@ THE SOFTWARE.
   </pluginRepositories>
 
   <scm>
-    <connection>scm:git:git://github.com/jenkinsci/jenkinsfile-runner.git</connection>
-    <developerConnection>scm:git:git@github.com:jenkinsci/jenkinsfile-runner.git</developerConnection>
-    <url>https://github.com/jenkinsci/jenkinsfile-runner</url>
-    <tag>HEAD</tag>
+    <connection>scm:git:git://github.com/${gitHubRepo}.git</connection>
+    <developerConnection>scm:git:git@github.com:${gitHubRepo}.git</developerConnection>
+    <url>https://github.com/${gitHubRepo}</url>
+    <tag>${scmTag}</tag>
   </scm>
 
   <profiles>
-    <profile>
-      <id>package-app</id>
-      <activation>
-        <activeByDefault>true</activeByDefault>
-      </activation>
-      <modules>
-        <module>app</module>
-      </modules>
-    </profile>
     <profile>
       <id>package-vanilla</id>
       <activation>
@@ -228,6 +194,40 @@ THE SOFTWARE.
       <modules>
         <module>tests</module>
       </modules>
+    </profile>
+    <profile>
+      <id>jacoco</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <version>0.8.7</version>
+            <executions>
+              <execution>
+                <goals>
+                  <goal>prepare-agent</goal>
+                </goals>
+              </execution>
+             <execution>
+                <id>report</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>report-aggregate</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- TODO: delete once https://github.com/jenkinsci/pom/pull/138 is integrated -->
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>${maven-surefire-plugin.version}</version>
+            <configuration>
+              <argLine>-Djdk.net.URLClassPath.disableClassPathURLCheck=true ${argLine}</argLine>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
   </profiles>
 </project>

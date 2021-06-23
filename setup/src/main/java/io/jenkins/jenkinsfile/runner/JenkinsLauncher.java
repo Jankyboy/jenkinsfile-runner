@@ -1,9 +1,22 @@
 package io.jenkins.jenkinsfile.runner;
 
 import hudson.ClassicPluginStrategy;
+import hudson.PluginManager;
 import hudson.util.PluginServletFilter;
-import io.jenkins.jenkinsfile.runner.bootstrap.Bootstrap;
-import io.jenkins.jenkinsfile.runner.util.HudsonHomeLoader;
+import io.jenkins.jenkinsfile.runner.bootstrap.ClassLoaderBuilder;
+import io.jenkins.jenkinsfile.runner.bootstrap.commands.JenkinsLauncherCommand;
+import io.jenkins.jenkinsfile.runner.bootstrap.commands.JenkinsLauncherOptions;
+import io.jenkins.jenkinsfile.runner.util.JenkinsHomeLoader;
+import java.io.File;
+import java.io.IOException;
+import java.util.EnumSet;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.servlet.DispatcherType;
+import javax.servlet.ServletContext;
+import jenkins.model.Jenkins;
+import jenkins.util.SystemProperties;
+import org.apache.commons.io.FileUtils;
 import org.eclipse.jetty.security.AbstractLoginService;
 import org.eclipse.jetty.security.LoginService;
 import org.eclipse.jetty.server.Server;
@@ -12,31 +25,44 @@ import org.eclipse.jetty.webapp.Configuration;
 import org.eclipse.jetty.webapp.WebAppContext;
 import org.eclipse.jetty.webapp.WebXmlConfiguration;
 
-import javax.servlet.DispatcherType;
-import javax.servlet.ServletContext;
-import java.util.EnumSet;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
 /**
  * Shared behaviour for different modes of launching an embedded Jenkins in the context of jenkinsfile-runner.
  */
-public abstract class JenkinsLauncher extends JenkinsEmbedder {
-    protected final Bootstrap bootstrap;
+public abstract class JenkinsLauncher<T extends JenkinsLauncherCommand> extends JenkinsEmbedder {
 
-    public JenkinsLauncher(Bootstrap bootstrap) {
-        this.bootstrap = bootstrap;
-        if(bootstrap.runHome != null) {
-            if(!bootstrap.runHome.isDirectory()) {
-                throw new IllegalArgumentException("--runHome is not a directory: " + bootstrap.runHome.getAbsolutePath());
+    protected final T command;
+
+    private static final Logger LOGGER = Logger.getLogger(JenkinsLauncher.class.getName());
+
+    public JenkinsLauncher(T command) {
+        this.command = command;
+        final JenkinsLauncherOptions launcherOptions = command.getLauncherOptions();
+        if (launcherOptions.jenkinsHome != null) {
+            String[] list = launcherOptions.jenkinsHome.list();
+            if (!launcherOptions.jenkinsHome.isDirectory() || list == null) {
+                throw new IllegalArgumentException("--runHome is not a directory: " + launcherOptions.jenkinsHome.getAbsolutePath());
             }
-            if(bootstrap.runHome.list().length > 0) {
-                throw new IllegalArgumentException("--runHome directory is not empty: " + bootstrap.runHome.getAbsolutePath());
+            if (list.length > 0) {
+                throw new IllegalArgumentException("--runHome directory is not empty: " + launcherOptions.jenkinsHome.getAbsolutePath());
             }
 
             //Override homeLoader to use existing directory instead of creating temporary one
-            this.homeLoader = new HudsonHomeLoader.UseExisting(bootstrap.runHome.getAbsoluteFile());
+            this.homeLoader = new JenkinsHomeLoader.UseExisting(launcherOptions.jenkinsHome.getAbsoluteFile());
         }
+    }
+
+    @Override
+    protected Jenkins newJenkins() throws Exception {
+        final Jenkins j = super.newJenkins();
+        // Notify the bootstrap about the plugin classloader to be used in its logic
+     //   command.setPluginClassloader(j.getPluginManager().uberClassLoader);
+
+        // Configure the agent endpoint
+        if (command.launcherOptions.agentPort != null) {
+            j.setSlaveAgentPort(command.launcherOptions.agentPort);
+        }
+
+        return j;
     }
 
     /**
@@ -44,16 +70,20 @@ public abstract class JenkinsLauncher extends JenkinsEmbedder {
      */
     @Override
     protected ServletContext createWebServer() throws Exception {
-        QueuedThreadPool queuedThreadPool = new QueuedThreadPool(10);
-        server = new Server(queuedThreadPool);
+        final JenkinsLauncherOptions launcherOptions = command.getLauncherOptions();
 
-        WebAppContext context = new WebAppContext(bootstrap.warDir.getPath(), contextPath);
+        QueuedThreadPool queuedThreadPool = new QueuedThreadPool(10);
+        server = launcherOptions.httpPort != null
+                ? new Server(launcherOptions.httpPort)
+                : new Server(queuedThreadPool);
+
+        WebAppContext context = new WebAppContext(launcherOptions.warDir.getPath(), contextPath);
         context.setClassLoader(getClass().getClassLoader());
         context.setConfigurations(new Configuration[]{new WebXmlConfiguration()});
         context.addBean(new NoListenerConfiguration(context));
         server.setHandler(context);
         context.getSecurityHandler().setLoginService(configureUserRealm());
-        context.setResourceBase(bootstrap.warDir.getPath());
+        context.setResourceBase(launcherOptions.warDir.getPath());
 
         // Jenkins core and some extension points supply extension points which try to access the filter
         // In Jenkins core it is define in web.xml
@@ -62,13 +92,26 @@ public abstract class JenkinsLauncher extends JenkinsEmbedder {
 
         server.start();
 
-        localPort = -1;
+        localPort = launcherOptions.httpPort != null ? launcherOptions.httpPort : -1;
 
-        setPluginManager(new PluginManagerImpl(context.getServletContext(), bootstrap.pluginsDir));
+        String pluginManagerClass = SystemProperties.getString(PluginManager.CUSTOM_PLUGIN_MANAGER);
+        if (pluginManagerClass == null) {
+            // Standard plugin manager for JFR
+            setPluginManager(new PluginManagerImpl(context.getServletContext(), launcherOptions.pluginsDir));
+        } else {
+            LOGGER.log(Level.INFO, "Will use a custom plugin manager {0}. " +
+                    "Note that the --pluginsDir option is not used in this case. ", pluginManagerClass);
+            setPluginManager(null);
+        }
 
         return context.getServletContext();
     }
 
+    //TODO: add support of timeout
+    /**
+     * Launches the Jenkins instance, without any time out or output message.
+     * @return the return code for the process
+     */
     public int launch() throws Throwable {
         Thread currentThread = Thread.currentThread();
         String originalThreadName = currentThread.getName();
@@ -83,13 +126,9 @@ public abstract class JenkinsLauncher extends JenkinsEmbedder {
     }
 
     /**
-     * @return the thread name to use for executing the action
-     */
-    protected abstract String getThreadName();
-
-    /**
-     * Actually launches the Jenkins instance, without any time out or output message.
-     * @return the return code for the process
+     * Launches the payload.
+     * @return Exit code
+     * @throws Exception Any error
      */
     protected abstract int doLaunch() throws Exception;
 
@@ -116,21 +155,40 @@ public abstract class JenkinsLauncher extends JenkinsEmbedder {
      * We don't want to clutter console with log messages, so kill of any unimportant ones.
      */
     private void setLogLevels() {
-        Logger.getLogger("").setLevel(Level.WARNING);
-        // Prevent warnings for plugins with old plugin POM (JENKINS-54425)
-        Logger.getLogger(ClassicPluginStrategy.class.getName()).setLevel(Level.SEVERE);
+        if (System.getProperty("java.util.logging.config.file") == null) {
+            Logger.getLogger("").setLevel(Level.WARNING);
+            // Prevent warnings for plugins with old plugin POM (JENKINS-54425)
+            Logger.getLogger(ClassicPluginStrategy.class.getName()).setLevel(Level.SEVERE);
+        } else {
+            // Rely on the user-supplied logging configuration
+            LOGGER.log(Level.INFO, "Will not override system loggers, because the 'java.util.logging.config.file' system property is set");
+        }
     }
 
-    /**
-     * Skips the clean up.
-     *
-     * This was initially motivated by SLF4J leaving gnarly messages.
-     * The whole JVM is going to die anyway, so we don't really care about cleaning up anything nicely.
-     */
     @Override
     public void after() throws Exception {
-        jenkins = null;
+        if (command.launcherOptions.skipShutdown) {
+            // Skips the clean up. This was initially motivated by SLF4J leaving gnarly messages.
+            // The whole JVM is going to die anyway, but without the cleanup the Jenkins termination logic won't be invoked
+            // It may lead to issues in plugins which rely on the shutdown logic (agent connectors, async event streaming, etc.)
+            jenkins = null;
+        }
         super.after();
+    }
+
+    @Override
+    protected void setupHome(File home) throws IOException {
+        final JenkinsLauncherOptions launcherOptions = command.getLauncherOptions();
+        if (launcherOptions.withInitHooks != null) {
+            String[] list = launcherOptions.withInitHooks.list();
+            if (!launcherOptions.withInitHooks.isDirectory() || list == null) {
+                throw new IllegalArgumentException("--withInitHooks is not a directory: " + launcherOptions.withInitHooks.getAbsolutePath());
+            }
+            if (list.length == 0) {
+                throw new IllegalArgumentException("--withInitHooks directory does not contain any hook: " + launcherOptions.withInitHooks.getAbsolutePath());
+            }
+            FileUtils.copyDirectory(launcherOptions.withInitHooks, home.getAbsoluteFile().toPath().resolve("init.groovy.d").toFile());
+        }
     }
 
     private static class JFRLoginService extends AbstractLoginService {
@@ -148,5 +206,17 @@ public abstract class JenkinsLauncher extends JenkinsEmbedder {
         protected UserPrincipal loadUserInfo(String username) {
             return null;
         }
+    }
+
+    protected Class<?> getClassFromJar(String classname) throws IOException, ClassNotFoundException {
+        ClassLoader cl = new ClassLoaderBuilder(jenkins.getPluginManager().uberClassLoader)
+            .collectJars(command.getPayloadJarDir())
+            .make();
+        Thread.currentThread().setContextClassLoader(cl);
+        return cl.loadClass(classname);
+    }
+
+    protected String getThreadName() {
+        return "Executing " + env.displayName();
     }
 }
